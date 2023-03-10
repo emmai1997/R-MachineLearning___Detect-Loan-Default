@@ -1,0 +1,1843 @@
+---
+title: "R Notebook"
+author: "Emma Wang"
+output:
+  word_document: default
+  html_notebook: default
+---
+
+# Preparation
+## Load Library
+
+```{r, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(readr)
+library(skimr)
+library(janitor)
+library(tidymodels)
+library(xgboost)
+library(reshape2)
+library(broom)
+library(vip)
+library(solitude)
+library(ggpubr)
+library(rpart.plot)
+library(doParallel)
+library(parallelly)
+library(magrittr)
+library(DALEX)    
+library(DALEXtra)
+library(ggplot2)
+library(dplyr)
+library(lubridate)
+```
+
+## Read Data
+
+```{r, warning=FALSE, message=FALSE}
+loan_raw <- read_csv("loan_train.csv") %>% clean_names()
+```
+
+## Skim Data
+
+```{r, warning=FALSE, message=FALSE}
+skim(loan_raw)
+head(loan_raw)
+```
+
+
+## Remove & Mutate Variables
+
+```{r, warning=FALSE, message=FALSE}
+loan <- loan_raw %>% 
+  filter(!is.na(id)) %>% 
+  mutate(issue_d = mdy(issue_d),
+         earliest_cr_line = year(mdy(earliest_cr_line)),
+         last_pymnt_d = mdy(last_pymnt_d),
+         last_credit_pull_d = mdy(last_credit_pull_d))
+
+loan <- loan %>% 
+  mutate(loan_status = as.factor(loan_status),
+         issue_w = as.numeric(difftime(Sys.time(), issue_d,  units = "weeks")),
+         earliest_cr_line_y = as.numeric(2022 - earliest_cr_line),
+         last_pymnt_w = as.numeric(difftime(Sys.time(), last_pymnt_d, units = "weeks")),
+         last_credit_pull_w = as.numeric(difftime(Sys.time(), last_credit_pull_d, units = "weeks")),
+         int_rate = as.numeric(sub("%", "", int_rate)),
+         revol_util = as.numeric(sub("%", "", revol_util))) %>% 
+  select(-emp_title, -desc, -url, -title, -mths_since_last_delinq, -mths_since_last_record, -collections_12_mths_ex_med, -chargeoff_within_12_mths, -next_pymnt_d, -id, -member_id, -policy_code, -application_type, -issue_d, -earliest_cr_line, -last_credit_pull_d, -last_pymnt_d) 
+
+skim(loan)
+head(loan)
+```
+
+# Exploratory Analysis
+## Explore Target
+
+```{r, warning=FALSE, message=FALSE}
+loan_summary <- loan %>%
+  count(loan_status) %>%
+  mutate(pct = n/sum(n))
+
+loan_summary
+
+loan_summary %>%
+  ggplot(aes(x=factor(loan_status),y=pct)) +
+  geom_col()  + 
+  geom_text(aes(label = round(pct*100,1)) , vjust = 2.5, colour = "blue") + 
+  labs(title="Loan Status", x="Status", y="PCT")
+```
+
+## Explore Numeric Variables
+
+```{r, warning=FALSE, message=FALSE}
+options(scipen = 999)
+num_stat <- loan %>%
+   pivot_longer(cols = is.numeric, names_to = "column", values_to = "value") %>%
+   dplyr::select(column, value) %>%
+   group_by(column) %>%
+   summarise(count = n(),
+             val_miss = sum(is.na(value)),
+             n_dis = n_distinct(value),
+             mean = mean(value, na.rm = TRUE),
+             med = median(value, na.rm = TRUE),
+             max = max(value, na.rm = TRUE),
+             min = min(value, na.rm = TRUE),
+             std = sd(value, na.rm = TRUE)
+             )
+num_stat
+
+for (col in num_stat$column){
+  histo <- loan %>%
+  ggplot(aes(!!as.name(col), fill=loan_status))+
+  geom_histogram(bins=30, position = "fill") +
+  labs(title = paste("Is" , as.name(col), "a useful predictor")) +
+  ylab("pct")+ xlab(as.name(col))
+  print(histo)
+}
+```
+
+## Explore Nominal Variables
+
+```{r, warning=FALSE, message=FALSE}
+
+char_explore <- function(col){
+  
+  loan %>%
+    ggplot(., aes(!!as.name(col))) + 
+    geom_bar(aes(fill = loan_status), position = "fill")  +
+    labs(title = paste("bar-chart of",as.name(col))) +
+    theme(axis.text.x = element_text(angle = 45, hjust =1))
+    
+}
+
+
+for (column in names(loan %>% select_if (is_character))){
+  {
+    chrt <- char_explore(column)
+    print(chrt)
+  }
+}
+```
+
+## Explore Correlation Matrix
+
+```{r, warning=FALSE, message=FALSE}
+cor_matrix <- loan %>%
+  mutate(loan_status = if_else(loan_status == "default", 1, 0),
+         loan_status = as.numeric(loan_status)) %>% 
+  select(is.numeric) %>%
+  na.omit() %>%
+  cor()
+cor_matrix
+
+cor_matrix %>% melt() %>%
+  mutate(value = round(value,3)) %>%
+  ggplot(aes(x=Var1, y=Var2, fill=value)) +
+  geom_tile() +
+   scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+                        midpoint = 0, limit = c(-1,1), space = "Lab", 
+                        name="Pearson\nCorrelation") +
+   theme_minimal()+ 
+   theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+                                    size = 10, hjust = 1))+
+   coord_fixed() +
+   geom_text(aes(Var2, Var1, label = value), color = "black", size = 1)
+
+```
+
+
+# Isolation Forest
+## Create Recipe
+
+```{r, warning=FALSE, message=FALSE}
+if_recipe <- recipe(~.,loan) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_novel(all_nominal_predictors()) %>%
+  step_integer(sub_grade, zip_code, addr_state) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  prep()
+
+bake_if <- bake(if_recipe, loan)
+
+```
+
+## Train Model
+```{r, warning=FALSE, message=FALSE}
+iso_forest <- isolationForest$new(
+  sample_size = 256,
+  num_trees = 100,
+  max_depth = ceiling(log2(256)))
+
+
+if_fit <- iso_forest$fit(bake_if)
+```
+
+## Predict
+
+```{r, warning=FALSE, message=FALSE}
+if_train <- iso_forest$predict(bake_if)
+
+
+if_train %>%
+  ggplot(aes(average_depth)) +
+  geom_histogram(bins=20) + 
+  geom_vline(xintercept = 6.75, linetype="dotted", 
+                color = "blue", size=1.5) + 
+  labs(title = "Isolation Forest Average Tree Depth" )
+
+if_train %>%
+  ggplot(aes(anomaly_score)) +
+  geom_histogram(bins=20) + 
+  geom_vline(xintercept = 0.623, linetype="dotted", 
+                color = "blue", size=1.5) + 
+  labs(title="Isolation Forest Anomaly Score Above 0.623")
+```
+
+## Global Level Interpretation 
+
+```{r, warning=FALSE, message=FALSE}
+if_pred <- bind_cols(iso_forest$predict(bake_if), bake_if) %>%
+  mutate(anomaly = as.factor(if_else(average_depth <= 6.75, "Anomaly", "Normal")))
+
+if_pred %>%
+  arrange(average_depth) %>%
+  count(anomaly)
+```
+
+
+## Fit Outlier Tree 
+
+```{r, warning=FALSE, message=FALSE}
+options(scipen = 999)
+fmla <- as.formula(paste("anomaly ~ ", paste(bake_if %>% colnames(), collapse= "+")))
+
+outlier_tree <- decision_tree( min_n = 2, tree_depth = 3, cost_complexity = .01) %>%
+  set_mode("classification") %>%
+  set_engine("rpart") %>%
+  fit(fmla, data = if_pred)
+
+outlier_tree$fit
+
+rpart.plot(outlier_tree$fit,clip.right.labs = FALSE, branch = .3, under = TRUE, roundint=FALSE, extra=3)
+```
+
+## Global Anomaly Rules 
+
+```{r, warning=FALSE, message=FALSE}
+anomaly_rules <- rpart.rules(outlier_tree$fit,roundint=FALSE, extra = 4, cover = TRUE, clip.facs = TRUE) %>% clean_names() %>%
+  mutate(rule = "IF") 
+
+rule_cols <- anomaly_rules %>% select(starts_with("x_")) %>% colnames()
+
+for (col in rule_cols){
+anomaly_rules <- anomaly_rules %>%
+    mutate(rule = paste(rule, !!as.name(col)))
+}
+
+anomaly_rules %>%
+  as.data.frame() %>%
+  filter(anomaly == "Anomaly") %>%
+  mutate(rule = paste(rule, " THEN ", anomaly )) %>%
+  mutate(rule = paste(rule," coverage ", cover)) %>%
+  select( rule)
+
+anomaly_rules %>%
+  as.data.frame() %>%
+  filter(anomaly == "Normal") %>%
+  mutate(rule = paste(rule, " THEN ", anomaly )) %>%
+  mutate(rule = paste(rule," coverage ", cover)) %>%
+  select( rule)
+```
+
+```{r, warning=FALSE, message=FALSE}
+if_train <- bind_cols(iso_forest$predict(bake_if),
+                        bake_if)
+
+
+if_train %>%
+  arrange(desc(anomaly_score) ) %>%
+  filter(average_depth <= 6.75)
+```
+
+## Local Anomaly Rules
+
+```{r, warning=FALSE, message=FALSE}
+local_explainer <- function(ID){
+  
+  fmla <- as.formula(paste("anomaly ~ ", paste(bake_if %>% colnames(), collapse= "+")))
+  
+  if_train %>%
+    mutate(anomaly= as.factor(if_else(id==ID, "Anomaly", "Normal"))) -> local_df
+  
+  local_tree <-  decision_tree(mode="classification",
+                              tree_depth = 3,
+                              min_n = 1,
+                              cost_complexity=0) %>%
+                set_engine("rpart") %>%
+                    fit(fmla,local_df )
+  
+  local_tree$fit
+  
+  rpart.plot(local_tree$fit, roundint=FALSE, extra=3) %>% print()
+  
+  anomaly_rules <- rpart.rules(local_tree$fit, extra = 4, cover = TRUE, clip.facs = TRUE) %>% clean_names() %>%
+    filter(anomaly=="Anomaly") %>%
+    mutate(rule = "IF") 
+  
+  
+  rule_cols <- anomaly_rules %>% select(starts_with("x_")) %>% colnames()
+  
+  for (col in rule_cols){
+  anomaly_rules <- anomaly_rules %>%
+      mutate(rule = paste(rule, !!as.name(col)))
+  }
+  
+  as.data.frame(anomaly_rules) %>%
+    select(rule, cover) %>%
+    print()
+}
+
+if_train %>%
+  filter(average_depth <= 6.75) %>%
+  pull(id) -> anomaly_vect
+
+for (anomaly_id in anomaly_vect){
+  local_explainer(anomaly_id)
+}
+```
+
+# Classifation Modelling Prep
+## Split Data
+
+```{r, warning=FALSE, message=FALSE}
+set.seed(123)
+
+split <- initial_split(loan, prop = 0.7)
+
+train <- training(split)
+
+test <- testing(split)
+
+sprintf("Train PCT : %1.2f%%", nrow(train)/ nrow(loan) * 100)
+sprintf("Test  PCT : %1.2f%%", nrow(test)/ nrow(loan) * 100)
+
+kfold_splits <- vfold_cv(train, v=10)
+```
+
+## Create Recipe
+
+```{r, warning=FALSE, message=FALSE}
+the_recipe <- recipe(loan_status ~ ., data = train )%>% 
+  step_impute_median(all_numeric_predictors()) %>%
+  step_scale(all_numeric_predictors()) %>%
+  step_novel(all_nominal_predictors()) %>% 
+  step_unknown(all_nominal_predictors()) %>%
+  step_integer(sub_grade, zip_code, addr_state) %>%
+  step_dummy(all_nominal_predictors())
+
+the_bake <- bake(the_recipe %>% prep(), train )
+
+skim(the_bake)
+```
+
+
+## Parallel Calculation
+```{r, warning=FALSE, message=FALSE}
+all_cores <- detectCores(logical = TRUE)
+sprintf("# of Logical Cores: %d", all_cores)
+cl <- makeCluster(all_cores)
+registerDoParallel(cl)
+```
+
+# Random Forest
+## Tune Parameter
+
+```{r, warning=FALSE}
+
+rf_model <- rand_forest(trees = tune(), 
+                        min_n = tune()) %>% 
+  set_engine("ranger", importance="permutation") %>% 
+  set_mode("classification")
+
+rf_workflow <- workflow() %>%
+  add_recipe(the_recipe) %>%
+  add_model(rf_model)
+
+rf_search_res <- rf_workflow %>% 
+  tune_bayes(
+    resamples = kfold_splits,
+    initial = 5,
+    iter = 20,
+    control = control_bayes(no_improve = 5, verbose = TRUE)
+  )
+
+```
+
+## Tune Performance
+
+```{r}
+rf_search_res %>%
+  collect_metrics() %>%
+  ggplot(aes(min_n, mean, color = .metric)) +
+  geom_errorbar(aes(
+    ymin = mean - std_err,
+    ymax = mean + std_err
+  ),
+  alpha = 0.5
+  ) +
+  geom_line(size = 1.5) +
+  facet_wrap(~.metric, scales = "free", nrow = 2) +
+  scale_x_log10() +
+  theme(legend.position = "none")+
+  labs(title="impact of min_n")
+
+
+rf_search_res %>%
+  collect_metrics() %>%
+  ggplot(aes(trees, mean, color = .metric)) +
+  geom_errorbar(aes(
+    ymin = mean - std_err,
+    ymax = mean + std_err
+  ),
+  alpha = 0.5
+  ) +
+  geom_line(size = 1.5) +
+  facet_wrap(~.metric, scales = "free", nrow = 2) +
+  scale_x_log10() +
+  theme(legend.position = "none")+
+  labs(title="impact of trees")
+```
+
+
+## Train Model
+
+```{r, warning=FALSE, message=FALSE}
+
+rf_search_res %>%
+  collect_metrics()  %>% 
+  filter(.metric == "roc_auc")
+
+highest_rf_auc <- rf_search_res %>%
+  select_best("roc_auc")
+
+highest_rf_auc
+
+rf_wflow <- finalize_workflow(
+  rf_workflow, highest_rf_auc
+) %>% 
+  fit(train)
+```
+
+## Predict
+
+```{r, warning=FALSE, message=FALSE}
+options(yardstick.event_first = FALSE)
+
+predict(rf_wflow, train, type = "prob") %>%
+  bind_cols(predict(rf_wflow, train, type = "class")) %>%
+  mutate(part = "train") %>%
+  bind_cols(., train) -> rf_scored_train
+
+predict(rf_wflow, test, type = "prob") %>%
+  bind_cols(predict(rf_wflow,  test, type = "class")) %>%
+  mutate(part = "testing") %>%
+  bind_cols(., test) -> rf_scored_test
+```
+
+## Confusion Matrix
+
+```{r, warning=FALSE, message=FALSE}
+rf_scored_train %>%
+  conf_mat(
+  truth = loan_status,
+  estimate = .pred_class,
+  dnn = c("Prediction", "Truth")
+) %>%
+  autoplot(type = "heatmap") + 
+  labs(title="Training Confusion Matrix")
+
+rf_scored_test %>%
+  conf_mat(
+  truth = loan_status,
+  estimate = .pred_class,
+  dnn = c("Prediction", "Truth")
+) %>%
+  autoplot(type = "heatmap") + 
+  labs(title="Testing Confusion Matrix")
+```
+
+## Evaluating Metrics
+
+```{r, warning=FALSE, message=FALSE}
+bind_rows (rf_scored_train, rf_scored_test)  %>%
+  group_by(part) %>% 
+  metrics(loan_status, .pred_default, estimate = .pred_class) %>%
+  filter(.metric %in% c('accuracy', 'roc_auc', 'mn_log_loss')) %>%
+  pivot_wider(names_from = .metric, values_from = .estimate)
+
+bind_rows (rf_scored_train, rf_scored_test)  %>%
+  group_by(part) %>% 
+  roc_curve(loan_status, .pred_default) %>%
+  autoplot() +
+  geom_vline(xintercept = 0.5, color = "gray") +
+  geom_vline(xintercept = 0.25, color = "gray") +
+  geom_vline(xintercept = 0.75, color = "gray") +
+  geom_vline(xintercept = 0.216, color = "red") +
+  labs(title = "RF ROC Curve" , x = "FPR(1 - specificity)", y = "TPR(recall)") 
+
+caret:: confusionMatrix(rf_scored_train$.pred_class, rf_scored_train$loan_status, mode = "everything", positive="default")
+
+caret:: confusionMatrix(rf_scored_test$.pred_class, rf_scored_test$loan_status, mode = "everything", positive="default")
+```
+
+## Choose Threshold and Operating Range
+
+```{r, warning=FALSE, message=FALSE}
+rf_hist <- rf_scored_test %>%
+  ggplot(aes(.pred_default, fill = loan_status)) +
+  geom_histogram(bins = 50) +
+  geom_vline(xintercept = 0.5, color = "gray") +
+  geom_vline(xintercept = 0.25, color = "gray") +
+  geom_vline(xintercept = 0.75, color = "gray") +
+  geom_vline(xintercept = 0.216, color = "red") +
+  labs(
+    title = paste("Distribution of the Probabilty of Default:", "RF Model") ,
+    x = ".pred_default",
+    y = "count"
+  ) 
+
+rf_hist
+
+rf_operating_range <- rf_scored_test %>%
+  roc_curve(loan_status, .pred_default)  %>%
+  mutate(
+    fpr = round((1 - specificity), 2),
+    recall = round(sensitivity, 3),
+    fnr = round((1-sensitivity), 2),
+    score_threshold =  round(.threshold, 3)
+  ) %>%
+  group_by(fnr) %>%
+  summarise(threshold = round(mean(score_threshold),3),
+            recall = mean(recall),
+            fpr = mean(fpr)) %>%
+  filter(fnr <= 0.1)
+
+rf_operating_range
+```
+
+## Find Precision
+
+```{r, warning=FALSE, message=FALSE}
+precision_funk <- function(threshold){
+  rf_scored_test %>%
+  mutate(precision_x_pct = as.factor(if_else(.pred_default >= threshold,"default","current"))) %>% 
+  precision(loan_status, precision_x_pct) %>% print()
+}
+
+precision_funk(threshold = 0.070)
+precision_funk(threshold = 0.121)
+precision_funk(threshold = 0.154)
+precision_funk(threshold = 0.193)
+precision_funk(threshold = 0.216)
+precision_funk(threshold = 0.241)
+precision_funk(threshold = 0.263)
+precision_funk(threshold = 0.287)
+precision_funk(threshold = 0.311)
+precision_funk(threshold = 0.329)
+```
+
+## Potential Savings in Every 1000 Applications
+
+```{r, warning=FALSE, message=FALSE}
+# At 5% FNR Operating Level
+(1000*0.15*mean(loan$loan_amnt)) - (1000*0.05*mean(loan$loan_amnt) + 1000*0.074*mean(loan$loan_amnt)*(mean(loan$int_rate)/100))
+```
+
+## BreakDown Explainations
+
+```{r, warning=FALSE, message=FALSE}
+
+set.seed(626)
+train_sample <- train[sample(1:nrow(train), size = 1000), ]   
+
+rf_glb_explainer <- 
+  explain_tidymodels(
+    rf_wflow,   
+    data = train_sample,  
+    y = train_sample$loan_status,
+    verbose = FALSE
+  )
+
+rf_single_record <- rf_scored_test %>% 
+  mutate(intercept = "", prediction = .pred_default) %>%
+  slice_max(order_by = .pred_default, n=10) %>% head(1) 
+
+rf_breakdown <- predict_parts(explainer = rf_glb_explainer,
+                              new_observation = rf_single_record )
+
+
+rf_breakdown %>% plot()
+
+rf_breakdown %>%
+  as_tibble() -> rf_breakdown_data 
+
+rf_single_record %>% 
+ gather(key="variable_name",value="value") -> rf_prediction_data 
+
+rf_prediction_prob <- rf_single_record[,".pred_default"] %>% pull()
+
+rf_breakdown_data %>% 
+  inner_join(rf_prediction_data) %>%
+  mutate(contribution = round(contribution,3),) %>%
+  filter(variable_name != "intercept") %>%
+  mutate(variable = paste(variable_name,value,sep = ": ")) %>% 
+  ggplot(aes(y=reorder(variable, contribution), x= contribution, fill=sign)) +
+  geom_col() + 
+  geom_text(aes(label=contribution), 
+          size=4,
+            position=position_dodge(width=0.7),
+            vjust=0.5,
+            )+
+  labs(
+    title = "DALEX explainations",
+    subtitle = paste("predicted:", as.character(round(rf_prediction_prob, 3))),
+                    x="contribution",
+                    y="features")
+
+```
+
+## Shap Explainations
+
+```{r, warning=FALSE, message=FALSE}
+rf_shapley <- predict_parts(explainer = rf_glb_explainer, 
+                               new_observation = rf_single_record,
+                               type="shap")
+
+rf_shapley %>% plot()
+
+rf_shapley %>%
+  as_tibble() -> rf_shap_data 
+
+rf_single_record %>% 
+ gather(key="variable_name",value="value") -> rf_prediction_data
+
+rf_prediction_prob <- rf_single_record[,".pred_default"] %>% mutate(.pred_default = round(.pred_default,3)) %>% pull() 
+
+rf_shap_data %>% 
+  inner_join(rf_prediction_data) %>%
+  mutate(variable = paste(variable_name,value,sep = ": ")) %>% 
+  group_by(variable) %>%
+  summarize(contribution = mean(contribution)) %>%
+  mutate(contribution = round(contribution,3),
+         sign = if_else(contribution < 0, "neg","pos")) %>%
+  ggplot(aes(y=reorder(variable, contribution), x= contribution, fill=sign)) +
+  geom_col() + 
+  geom_text(aes(label=contribution))+
+  labs(
+    title = "SHAPLEY explainations",
+    subtitle = paste("predicted probablity = ", rf_prediction_prob) ,
+                    x="contribution",
+                    y="features")
+```
+
+## VIP
+
+```{r, warning=FALSE, message=FALSE}
+rf_wflow %>%
+    pull_workflow_fit() %>%
+    vip(20) + 
+    labs("RF VIP")
+```
+
+
+## Partial Dependence
+
+```{r, warning=FALSE, message=FALSE}
+rf_explainer <- explain_tidymodels(
+  rf_wflow,
+  data = train_sample ,
+  y = train_sample$loan_status ,
+  verbose = TRUE
+)
+
+rf_pdp_plotter <- function(variable){
+  pdp_last_pymnt_amnt <- model_profile(
+  rf_explainer,
+  variables = variable
+)
+  
+  
+pdp_plot <- as_tibble(pdp_last_pymnt_amnt$agr_profiles) %>%
+  mutate(`_label_` = str_remove(`_label_`, "workflow_")) %>%
+  ggplot(aes(`_x_`, `_yhat_`, color = `_label_`)) +
+  geom_line(size = 1.2, alpha = 0.8) +
+  labs(
+    x = variable,
+     y = " Average prediction Impact ",
+    color = NULL,
+    title = "Partial Dependence Profile Plot:",
+    subtitle = variable
+  )
+print(pdp_plot)
+}
+
+numeric_vars <- c("last_pymnt_amnt", "last_credit_pull_w", "int_rate", "last_pymnt_w", "issue_w")
+
+for (var in numeric_vars){
+  rf_pdp_plotter(var)
+}
+
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+rf_pdp_categorical <-function(variable){
+
+pdp_term <- model_profile(
+  rf_explainer,
+  variables = variable,
+  variable_type="categorical"
+)
+
+p1 <- as_tibble(pdp_term$agr_profiles) %>%
+  ggplot(aes(reorder(`_x_`, `_yhat_`),`_yhat_`)) +
+  geom_col() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+
+  labs(
+    x = variable,
+    y = " Average prediction Impact ",
+    title = "Partial Dependence Profile Plot:",
+    subtitle = variable
+  )
+print(p1)
+}
+categorical_vars <- c("term","sub_grade","grade")
+
+for (var in categorical_vars){
+  rf_pdp_categorical(var)
+}
+```
+
+
+# XGBoost
+## Tune parameter
+
+```{r, warning=FALSE}
+
+xgb_model <- boost_tree(trees=tune(), 
+                        learn_rate = tune(),
+                        tree_depth = tune()) %>%
+  set_engine("xgboost",
+             importance="permutation") %>%
+  set_mode("classification")
+
+xgb_wflow <-workflow() %>%
+  add_recipe(the_recipe) %>%
+  add_model(xgb_model)
+
+xgb_search_res <- xgb_wflow %>%
+  tune_bayes(
+    resamples = kfold_splits,
+    initial = 5,
+    iter = 20,
+    metrics = metric_set(roc_auc, accuracy),
+    control = control_bayes(no_improve = 5, verbose = TRUE)
+  )
+```
+
+## Tune Performance
+
+```{r}
+xgb_search_res %>%
+  collect_metrics() %>%
+  ggplot(aes(learn_rate, mean, color = .metric)) +
+  geom_errorbar(aes(
+    ymin = mean - std_err,
+    ymax = mean + std_err
+  ),
+  alpha = 0.5
+  ) +
+  geom_line(size = 1.5) +
+  facet_wrap(~.metric, scales = "free", nrow = 2) +
+  scale_x_log10() +
+  theme(legend.position = "none")+
+  labs(title="impact of learn_rate")
+
+
+xgb_search_res %>%
+  collect_metrics() %>%
+  ggplot(aes(trees, mean, color = .metric)) +
+  geom_errorbar(aes(
+    ymin = mean - std_err,
+    ymax = mean + std_err
+  ),
+  alpha = 0.5
+  ) +
+  geom_line(size = 1.5) +
+  facet_wrap(~.metric, scales = "free", nrow = 2) +
+  scale_x_log10() +
+  theme(legend.position = "none")+
+  labs(title="impact of trees")
+
+
+xgb_search_res %>%
+  collect_metrics() %>%
+  ggplot(aes(tree_depth, mean, color = .metric)) +
+  geom_errorbar(aes(
+    ymin = mean - std_err,
+    ymax = mean + std_err
+  ),
+  alpha = 0.5
+  ) +
+  geom_line(size = 1.5) +
+  facet_wrap(~.metric, scales = "free", nrow = 2) +
+  scale_x_log10() +
+  theme(legend.position = "none")+
+  labs(title="impact of tree_depth")
+```
+
+## Train Model
+
+```{r, warning=FALSE, message=FALSE}
+xgb_search_res %>%
+  collect_metrics()  %>% 
+  filter(.metric == "roc_auc")
+
+lowest_xgb_rmse <- xgb_search_res %>%
+  select_best("roc_auc")
+
+lowest_xgb_rmse
+
+xgb_wflow <- finalize_workflow(
+  xgb_wflow, lowest_xgb_rmse
+) %>% 
+  fit(train)
+```
+
+## Predict
+
+```{r, warning=FALSE, message=FALSE}
+options(yardstick.event_first = FALSE)
+
+predict(xgb_wflow, train, type = "prob") %>%
+  bind_cols(predict(xgb_wflow, train, type = "class")) %>%
+  mutate(part = "train") %>%
+  bind_cols(., train) -> xgb_scored_train
+
+predict(xgb_wflow, test, type = "prob") %>%
+  bind_cols(predict(xgb_wflow,  test, type = "class")) %>%
+  mutate(part = "testing") %>%
+  bind_cols(., test) -> xgb_scored_test
+```
+
+## Confusion Matrix
+
+```{r, warning=FALSE, message=FALSE}
+xgb_scored_train %>%
+  conf_mat(
+  truth = loan_status,
+  estimate = .pred_class,
+  dnn = c("Prediction", "Truth")
+) %>%
+  autoplot(type = "heatmap") + 
+  labs(title="Training Confusion Matrix")
+
+xgb_scored_test %>%
+  conf_mat(
+  truth = loan_status,
+  estimate = .pred_class,
+  dnn = c("Prediction", "Truth")
+) %>%
+  autoplot(type = "heatmap") + 
+  labs(title="Testing Confusion Matrix")
+```
+
+## Evaluating Metrics
+
+```{r, warning=FALSE, message=FALSE}
+xgb_bind_pred <- bind_rows (xgb_scored_train, xgb_scored_test)  %>%
+  group_by(part)
+
+xgb_bind_pred %>% 
+  metrics(loan_status, .pred_default, estimate = .pred_class) %>%
+  filter(.metric %in% c('accuracy', 'roc_auc', 'mn_log_loss')) %>%
+  pivot_wider(names_from = .metric, values_from = .estimate)
+
+xgb_bind_pred %>% 
+  roc_curve(loan_status, .pred_default) %>%
+  autoplot() +
+  geom_vline(xintercept = 0.5, color = "gray") +
+  geom_vline(xintercept = 0.25, color = "gray") +
+  geom_vline(xintercept = 0.75, color = "gray") +
+  geom_vline(xintercept = 0.054, color = "red") +
+  labs(title = "XGB ROC Curve" , x = "FPR(1 - specificity)", y = "TPR(recall)") 
+
+
+caret:: confusionMatrix(xgb_scored_train$.pred_class, xgb_scored_train$loan_status, mode = "everything", positive="default")
+
+caret:: confusionMatrix(xgb_scored_test$.pred_class, xgb_scored_test$loan_status, mode = "everything", positive="default")
+
+```
+
+## Choose Threshold and Operating Range
+
+```{r, warning=FALSE, message=FALSE}
+xgb_hist <- xgb_scored_test %>%
+  ggplot(aes(.pred_default, fill = loan_status)) +
+  geom_histogram(bins = 50) +
+  geom_vline(xintercept = 0.5, color = "gray") +
+  geom_vline(xintercept = 0.25, color = "gray") +
+  geom_vline(xintercept = 0.75, color = "gray") +
+  geom_vline(xintercept = 0.054, color = "red") +
+  labs(
+    title = paste("Distribution of the Probabilty of default:", "XGB Model") ,
+    x = ".pred_default",
+    y = "count"
+  ) 
+
+xgb_hist
+
+xgb_operating_range <- xgb_scored_test %>%
+  roc_curve(loan_status, .pred_default)  %>%
+  mutate(
+    fpr = round((1 - specificity), 2),
+    recall = round(sensitivity, 3),
+    fnr = round((1-sensitivity), 2),
+    score_threshold =  round(.threshold, 3)
+  ) %>%
+  group_by(fnr) %>%
+  summarise(threshold = round(mean(score_threshold),3),
+            recall = mean(recall),
+            fpr = mean(fpr)) %>%
+  filter(fnr <= 0.1)
+
+xgb_operating_range
+```
+
+## Find Precision
+
+```{r, warning=FALSE, message=FALSE}
+precision_funk <- function(threshold){
+  xgb_scored_test %>%
+  mutate(precision_x_pct = as.factor(if_else(.pred_default >= threshold,"default","current"))) %>% 
+  precision(loan_status, precision_x_pct) %>% print()
+}
+
+precision_funk(threshold = 0.001)
+precision_funk(threshold = 0.004)
+precision_funk(threshold = 0.010)
+precision_funk(threshold = 0.026)
+precision_funk(threshold = 0.054)
+precision_funk(threshold = 0.119)
+precision_funk(threshold = 0.232)
+precision_funk(threshold = 0.346)
+precision_funk(threshold = 0.494)
+precision_funk(threshold = 0.652)
+```
+
+## Potential Savings
+
+```{r, warning=FALSE, message=FALSE}
+# At 5% FNR Operating Level
+(1000*0.15*mean(loan$loan_amnt)) - (1000*0.05*mean(loan$loan_amnt) + 1000*0.02*mean(loan$loan_amnt)*(mean(loan$int_rate)/100))
+```
+
+## BreakDown Explainations
+
+```{r, warning=FALSE, message=FALSE}
+ 
+xgb_glb_explainer <- 
+  explain_tidymodels(
+    xgb_wflow,   
+    data = train_sample,  
+    y = train_sample$loan_status, 
+    verbose = FALSE
+  )
+
+xgb_single_record <- xgb_scored_test %>% 
+  mutate(intercept = "", prediction = .pred_default) %>%
+  slice_max(order_by = .pred_default, n=10) %>% head(1) 
+
+xgb_breakdown <- predict_parts(explainer = xgb_glb_explainer, 
+                              new_observation = xgb_single_record 
+                               )
+
+
+xgb_breakdown %>% plot()
+
+xgb_breakdown %>%
+  as_tibble() -> xgb_breakdown_data 
+
+xgb_single_record %>% 
+ gather(key="variable_name",value="value") -> xgb_prediction_data 
+
+xgb_prediction_prob <- xgb_single_record[,".pred_default"] %>% pull()
+
+xgb_breakdown_data %>% 
+  inner_join(xgb_prediction_data) %>%
+  mutate(contribution = round(contribution,3),) %>%
+  filter(variable_name != "intercept") %>%
+  mutate(variable = paste(variable_name,value,sep = ": ")) %>% 
+  ggplot(aes(y=reorder(variable, contribution), x= contribution, fill=sign)) +
+  geom_col() + 
+  geom_text(aes(label=contribution), 
+          size=4,
+            position=position_dodge(width=0.7),
+            vjust=0.5,
+            )+
+  labs(
+    title = "DALEX explainations",
+    subtitle = paste("predicted:", as.character(round(rf_prediction_prob, 3))),
+                    x="contribution",
+                    y="features")
+
+```
+
+## Shap Explainations
+
+```{r, warning=FALSE, message=FALSE}
+xgb_shapley <- predict_parts(explainer = xgb_glb_explainer, 
+                               new_observation = xgb_single_record,
+                               type="shap")
+
+xgb_shapley %>% plot()
+
+xgb_shapley %>%
+  as_tibble() -> xgb_shap_data 
+
+xgb_single_record %>% 
+ gather(key="variable_name",value="value") -> xgb_prediction_data
+
+xgb_prediction_prob <- xgb_single_record[,".pred_default"] %>% mutate(.pred_default = round(.pred_default,3)) %>% pull() 
+
+xgb_shap_data %>% 
+  inner_join(xgb_prediction_data) %>%
+  mutate(variable = paste(variable_name,value,sep = ": ")) %>% 
+  group_by(variable) %>%
+  summarize(contribution = mean(contribution)) %>%
+  mutate(contribution = round(contribution,3),
+         sign = if_else(contribution < 0, "neg","pos")) %>%
+  ggplot(aes(y=reorder(variable, contribution), x= contribution, fill=sign)) +
+  geom_col() + 
+  geom_text(aes(label=contribution))+
+  labs(
+    title = "SHAPLEY explainations",
+    subtitle = paste("predicted probablity = ", xgb_prediction_prob) ,
+                    x="contribution",
+                    y="features")
+```
+
+## VIP
+
+```{r, warning=FALSE, message=FALSE}
+xgb_wflow %>%
+    pull_workflow_fit() %>%
+    vip(20) + 
+    labs("XGB VIP")
+```
+
+## Partial Dependence
+
+```{r, warning=FALSE, message=FALSE}
+xgb_explainer <- explain_tidymodels(
+  xgb_wflow,
+  data = train_sample ,
+  y = train_sample$loan_status ,
+  verbose = TRUE
+)
+
+xgb_pdp_plotter <- function(variable){
+  pdp_last_pymnt_amnt <- model_profile(
+  xgb_explainer,
+  variables = variable
+)
+  
+  
+pdp_plot <- as_tibble(pdp_last_pymnt_amnt$agr_profiles) %>%
+  mutate(`_label_` = str_remove(`_label_`, "workflow_")) %>%
+  ggplot(aes(`_x_`, `_yhat_`, color = `_label_`)) +
+  geom_line(size = 1.2, alpha = 0.8) +
+  labs(
+    x = variable,
+     y = " Average prediction Impact ",
+    color = NULL,
+    title = "Partial Dependence Profile Plot:",
+    subtitle = variable
+  )
+print(pdp_plot)
+}
+
+numeric_vars <- c("last_pymnt_amnt", "last_credit_pull_w", "total_rec_late_fee", "last_pymnt_w", "int_rate", "dti")
+
+for (var in numeric_vars){
+  xgb_pdp_plotter(var)
+}
+
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+xgb_pdp_categorical <-function(variable){
+
+pdp_term <- model_profile(
+  xgb_explainer,
+  variables = variable,
+  variable_type="categorical"
+)
+
+p1 <- as_tibble(pdp_term$agr_profiles) %>%
+  ggplot(aes(reorder(`_x_`, `_yhat_`),`_yhat_`)) +
+  geom_col() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+
+  labs(
+    x = variable,
+    y = " Average prediction Impact ",
+    title = "Partial Dependence Profile Plot:",
+    subtitle = variable
+  )
+print(p1)
+}
+categorical_vars <- c("sub_grade", "purpose",  "addr_state", "grade", "emp_length")
+
+for (var in categorical_vars){
+  xgb_pdp_categorical(var)
+}
+```
+
+# Neural Network
+## Tune Parameter
+
+```{r, warning=FALSE}
+
+nn_model <- mlp(hidden_units = tune(),
+                 penalty=tune(),
+                epochs = tune()) %>%
+  set_engine("nnet") %>%
+  set_mode("classification") 
+
+nn_wflow <-workflow() %>%
+  add_recipe(the_recipe) %>%
+  add_model(nn_model) 
+
+nn_search_res <- nn_wflow %>% 
+  tune_bayes(
+    resamples = kfold_splits,
+    initial = 5,
+    iter = 20,
+    control = control_bayes(no_improve = 5, verbose = TRUE)
+  )
+```
+
+## Tune Performance
+
+```{r}
+nn_search_res %>%
+  collect_metrics() %>%
+  ggplot(aes(hidden_units, mean, color = .metric)) +
+  geom_errorbar(aes(
+    ymin = mean - std_err,
+    ymax = mean + std_err
+  ),
+  alpha = 0.5
+  ) +
+  geom_line(size = 1.5) +
+  facet_wrap(~.metric, scales = "free", nrow = 2) +
+  scale_x_log10() +
+  theme(legend.position = "none")+
+  labs(title="impact of hidden_units")
+
+
+nn_search_res %>%
+  collect_metrics() %>%
+  ggplot(aes(penalty, mean, color = .metric)) +
+  geom_errorbar(aes(
+    ymin = mean - std_err,
+    ymax = mean + std_err
+  ),
+  alpha = 0.5
+  ) +
+  geom_line(size = 1.5) +
+  facet_wrap(~.metric, scales = "free", nrow = 2) +
+  scale_x_log10() +
+  theme(legend.position = "none")+
+  labs(title="impact of penalty")
+
+
+nn_search_res %>%
+  collect_metrics() %>%
+  ggplot(aes(epochs, mean, color = .metric)) +
+  geom_errorbar(aes(
+    ymin = mean - std_err,
+    ymax = mean + std_err
+  ),
+  alpha = 0.5
+  ) +
+  geom_line(size = 1.5) +
+  facet_wrap(~.metric, scales = "free", nrow = 2) +
+  scale_x_log10() +
+  theme(legend.position = "none")+
+  labs(title="impact of epochs")
+```
+
+
+## Train Model
+
+```{r, warning=FALSE, message=FALSE}
+nn_search_res %>%
+  collect_metrics()  
+
+nn_search_res %>%
+  select_best("roc_auc")
+
+best_auc <- nn_search_res %>%
+  select_best("roc_auc")
+
+best_auc
+
+nn_wflow <- finalize_workflow(
+  nn_wflow, best_auc
+) %>% 
+  fit(train)
+```
+
+## Predict
+
+```{r, warning=FALSE, message=FALSE}
+options(yardstick.event_first = FALSE)
+
+predict(nn_wflow, train, type = "prob") %>%
+  bind_cols(predict(nn_wflow, train, type = "class")) %>%
+  mutate(part = "train") %>%
+  bind_cols(., train) -> nn_scored_train
+
+predict(nn_wflow, test, type = "prob") %>%
+  bind_cols(predict(nn_wflow,  test, type = "class")) %>%
+  mutate(part = "testing") %>%
+  bind_cols(., test) -> nn_scored_test
+```
+
+## Confusion Matrix
+
+```{r, warning=FALSE, message=FALSE}
+nn_scored_train %>%
+  conf_mat(
+  truth = loan_status,
+  estimate = .pred_class,
+  dnn = c("Prediction", "Truth")
+) %>%
+  autoplot(type = "heatmap") + 
+  labs(title="Training Confusion Matrix")
+
+nn_scored_test %>%
+  conf_mat(
+  truth = loan_status,
+  estimate = .pred_class,
+  dnn = c("Prediction", "Truth")
+) %>%
+  autoplot(type = "heatmap") + 
+  labs(title="Testing Confusion Matrix")
+```
+
+## Evaluating Metrics
+
+```{r, warning=FALSE, message=FALSE}
+nn_bind_pred <- bind_rows (nn_scored_train, nn_scored_test)  %>%
+  group_by(part)
+
+nn_bind_pred %>% 
+  metrics(loan_status, .pred_default, estimate = .pred_class) %>%
+  filter(.metric %in% c('accuracy', 'roc_auc', 'mn_log_loss')) %>%
+  pivot_wider(names_from = .metric, values_from = .estimate)
+
+nn_bind_pred %>% 
+  roc_curve(loan_status, .pred_default) %>%
+  autoplot() +  
+  geom_vline(xintercept = 0.5, color = "gray") +
+  geom_vline(xintercept = 0.25, color = "gray") +
+  geom_vline(xintercept = 0.75, color = "gray") +
+  geom_vline(xintercept = 0.309, color = "red") +
+  labs(title = "NN ROC Curve" , x = "FPR(1 - specificity)", y = "TPR(recall)") 
+
+
+caret:: confusionMatrix(nn_scored_train$.pred_class, nn_scored_train$loan_status, mode = "everything", positive="default")
+
+caret:: confusionMatrix(nn_scored_test$.pred_class, nn_scored_test$loan_status, mode = "everything", positive="default")
+
+```
+
+## Choose Threshold and Operating Range
+
+```{r, warning=FALSE, message=FALSE}
+nn_hist <- nn_scored_test %>%
+  ggplot(aes(.pred_default, fill = loan_status)) +
+  geom_histogram(bins = 50) +
+  geom_vline(xintercept = 0.5, color = "gray") +
+  geom_vline(xintercept = 0.3, color = "gray") +
+  geom_vline(xintercept = 0.7, color = "gray") +
+  geom_vline(xintercept = 0.309, color = "red") +
+  labs(
+    title = paste("Distribution of the Probabilty of default:", "NN Model") ,
+    x = ".pred_default",
+    y = "count"
+  ) 
+
+nn_hist
+
+nn_operating_range <- nn_scored_test %>%
+  roc_curve(loan_status, .pred_default)  %>%
+  mutate(
+    fpr = round((1 - specificity), 2),
+    recall = round(sensitivity, 3),
+    fnr = round((1-sensitivity), 2),
+    score_threshold =  round(.threshold, 3)
+  ) %>%
+  group_by(fnr) %>%
+  summarise(threshold = round(mean(score_threshold),3),
+            recall = mean(recall),
+            fpr = mean(fpr)) %>%
+  filter(fnr <= 0.1)
+
+nn_operating_range
+```
+
+## Find Precision
+
+```{r, warning=FALSE, message=FALSE}
+precision_funk <- function(threshold){
+  nn_scored_test %>%
+  mutate(fpr_x_pct = as.factor(if_else(.pred_default >= threshold,"default","current"))) %>% 
+  precision(loan_status, fpr_x_pct) %>% print()
+}
+
+precision_funk(threshold = 0.271)
+precision_funk(threshold = 0.278)
+precision_funk(threshold = 0.285)
+precision_funk(threshold = 0.294)
+precision_funk(threshold = 0.309)
+precision_funk(threshold = 0.322)
+precision_funk(threshold = 0.334)
+precision_funk(threshold = 0.348)
+precision_funk(threshold = 0.358)
+precision_funk(threshold = 0.371)
+```
+
+## Potential Savings
+
+```{r, warning=FALSE, message=FALSE}
+# At 5% FNR Operating Level
+(1000*0.15*mean(loan$loan_amnt)) - (1000*0.05*mean(loan$loan_amnt) + 1000*0.078*mean(loan$loan_amnt)*(mean(loan$int_rate)/100))
+```
+
+
+## BreakDown Explainations
+
+```{r, warning=FALSE, message=FALSE}
+nn_glb_explainer <- 
+  explain_tidymodels(
+    nn_wflow,   
+    data = train_sample,  
+    y = train_sample$loan_status, 
+    verbose = FALSE
+  )
+
+nn_single_record <- nn_scored_test %>% 
+  mutate(intercept = "", prediction = .pred_default) %>%
+  slice_max(order_by = .pred_default, n=10) %>% head(1) 
+
+nn_breakdown <- predict_parts(explainer = nn_glb_explainer, 
+                              new_observation = nn_single_record 
+                               )
+
+
+nn_breakdown %>% plot()
+
+nn_breakdown %>%
+  as_tibble() -> nn_breakdown_data 
+
+nn_single_record %>% 
+ gather(key="variable_name",value="value") -> nn_prediction_data 
+
+nn_prediction_prob <- nn_single_record[,".pred_default"] %>% pull()
+
+nn_breakdown_data %>% 
+  inner_join(nn_prediction_data) %>%
+  mutate(contribution = round(contribution,3),) %>%
+  filter(variable_name != "intercept") %>%
+  mutate(variable = paste(variable_name,value,sep = ": ")) %>% 
+  ggplot(aes(y=reorder(variable, contribution), x= contribution, fill=sign)) +
+  geom_col() + 
+  geom_text(aes(label=contribution), 
+          size=4,
+            position=position_dodge(width=0.7),
+            vjust=0.5,
+            )+
+  labs(
+    title = "DALEX explainations",
+    subtitle = paste("predicted:", as.character(round(nn_prediction_prob, 3))),
+                    x="contribution",
+                    y="features")
+
+```
+
+
+## Shap Explainations
+
+```{r, warning=FALSE, message=FALSE}
+nn_shapley <- predict_parts(explainer = nn_glb_explainer, 
+                               new_observation = nn_single_record,
+                               type="shap")
+
+nn_shapley %>% plot()
+
+nn_shapley %>%
+  as_tibble() -> nn_shap_data 
+
+nn_single_record %>% 
+ gather(key="variable_name",value="value") -> nn_prediction_data
+
+nn_prediction_prob <- nn_single_record[,".pred_default"] %>% mutate(.pred_default = round(.pred_default,3)) %>% pull() 
+
+nn_shap_data %>% 
+  inner_join(nn_prediction_data) %>%
+  mutate(variable = paste(variable_name,value,sep = ": ")) %>% 
+  group_by(variable) %>%
+  summarize(contribution = mean(contribution)) %>%
+  mutate(contribution = round(contribution,3),
+         sign = if_else(contribution < 0, "neg","pos")) %>%
+  ggplot(aes(y=reorder(variable, contribution), x= contribution, fill=sign)) +
+  geom_col() + 
+  geom_text(aes(label=contribution))+
+  labs(
+    title = "SHAPLEY explainations",
+    subtitle = paste("predicted probablity = ", nn_prediction_prob) ,
+                    x="contribution",
+                    y="features")
+```
+
+## VIP
+
+```{r, warning=FALSE, message=FALSE}
+nn_wflow %>%
+    pull_workflow_fit() %>%
+    vip(20) + 
+    labs("NN VIP")
+```
+
+## Partial Dependence
+
+```{r, warning=FALSE, message=FALSE}
+nn_explainer <- explain_tidymodels(
+  nn_wflow,
+  data = train_sample ,
+  y = train_sample$loan_status ,
+  verbose = TRUE
+)
+
+nn_pdp_plotter <- function(variable){
+  pdp_last_pymnt_amnt <- model_profile(
+  nn_explainer,
+  variables = variable
+)
+  
+  
+pdp_plot <- as_tibble(pdp_last_pymnt_amnt$agr_profiles) %>%
+  mutate(`_label_` = str_remove(`_label_`, "workflow_")) %>%
+  ggplot(aes(`_x_`, `_yhat_`, color = `_label_`)) +
+  geom_line(size = 1.2, alpha = 0.8) +
+  labs(
+    x = variable,
+     y = " Average prediction Impact ",
+    color = NULL,
+    title = "Partial Dependence Profile Plot:",
+    subtitle = variable
+  )
+print(pdp_plot)
+}
+
+numeric_vars <- c("last_pymnt_amnt", "last_credit_pull_w", "last_pymnt_w", "total_rec_late_fee", "int_rate", "issue_w", "fico_range_low")
+
+for (var in numeric_vars){
+  nn_pdp_plotter(var)
+}
+
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+nn_pdp_categorical <-function(variable){
+
+pdp_term <- model_profile(
+  nn_explainer,
+  variables = variable,
+  variable_type="categorical"
+)
+
+p1 <- as_tibble(pdp_term$agr_profiles) %>%
+  ggplot(aes(reorder(`_x_`, `_yhat_`),`_yhat_`)) +
+  geom_col() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+
+  labs(
+    x = variable,
+    y = " Average prediction Impact ",
+    title = "Partial Dependence Profile Plot:",
+    subtitle = variable
+  )
+print(p1)
+}
+categorical_vars <- c("term","zip_code","sub_grade", "emp_length")
+
+for (var in categorical_vars){
+  nn_pdp_categorical(var)
+}
+```
+
+
+# Top 10 Records From XGB - the Best Model
+## Top 10 TP
+
+```{r, warning=FALSE, message=FALSE}
+xgb_score_test <- bind_cols(
+  predict(xgb_wflow, test, type="prob"), 
+   predict(xgb_wflow, test, type="class"),
+  test) %>% 
+  mutate(part = "test") 
+
+top_TP <- xgb_score_test %>%
+  filter(loan_status == "default") %>%
+  slice_max(order_by = .pred_default, n=10)
+
+top_TP
+```
+
+## Top 10 FP
+
+```{r, warning=FALSE, message=FALSE}
+top_FP <- xgb_score_test %>%
+  filter(loan_status == "current") %>%
+  slice_max(order_by = .pred_default, n=10)
+
+top_FP
+```
+
+
+## Top 10 FN
+
+```{r, warning=FALSE, message=FALSE}
+top_FN <- xgb_score_test %>%
+  filter(loan_status == "default") %>%
+  slice_min(order_by = .pred_default, n=10)
+
+top_FN
+```
+
+
+## Explain Top Records
+
+```{r, warning=FALSE, message=FALSE}
+top5_explainer <- explain_tidymodels(
+    xgb_wflow,    
+    data = train_sample,    
+    y = train_sample$loan_status,  
+    label = "xgboost",
+    verbose = FALSE
+  )
+
+explain_prediction <- function(single_record){
+record_shap <- predict_parts(explainer = top5_explainer, 
+                               new_observation = single_record,
+                               type="shap")
+
+record_shap %>% plot() %>% print()
+
+record_shap %>%
+  as_tibble() -> shap_data 
+
+single_record %>% 
+ gather(key="variable_name",value="value") -> prediction_data 
+
+prediction_prob <- single_record[,".pred_default"] %>% mutate(.pred_default = round(.pred_default,3)) %>% pull() 
+
+shap_data %>% 
+  inner_join(prediction_data) %>%
+  mutate(variable = paste(variable_name,value,sep = ": ")) %>% 
+  group_by(variable) %>%
+  summarize(contribution = mean(contribution)) %>%
+  mutate(contribution = round(contribution,3),
+         sign = if_else(contribution < 0, "neg","pos")) %>%
+  ggplot(aes(y=reorder(variable, contribution), x= contribution, fill=sign)) +
+  geom_col() + 
+  geom_text(aes(label=contribution))+
+  labs(
+    title = "SHAPLEY explainations",
+    subtitle = paste("predicted probablity = ",prediction_prob) ,
+                    x="contribution",
+                    y="features")
+  
+}
+```
+
+
+```{r, warning=FALSE, message=FALSE}
+for (row in 1:nrow(top_TP)) {
+    s_record <- top_TP[row,]
+    explain_prediction(s_record)
+} 
+```
+
+```{r, warning=FALSE, message=FALSE}
+for (row in 1:nrow(top_FP)) {
+    s_record <- top_FP[row,]
+    explain_prediction(s_record)
+} 
+```
+
+```{r, warning=FALSE, message=FALSE}
+for (row in 1:nrow(top_FN)) {
+    s_record <- top_FN[row,]
+    explain_prediction(s_record)
+} 
+```
+
+# Top 10 Records From RF
+## Tops Finding
+
+```{r}
+rf_score_test <- bind_cols(
+  predict(rf_wflow, test, type="prob"), 
+   predict(rf_wflow, test, type="class"),
+  test) %>% 
+  mutate(part = "test") 
+
+rf_top_TP <- rf_score_test %>%
+  filter(loan_status == "default") %>%
+  slice_max(order_by = .pred_default, n=10)
+
+rf_top_TP
+
+rf_top_FP <- rf_score_test %>%
+  filter(loan_status == "current") %>%
+  slice_max(order_by = .pred_default, n=10)
+
+rf_top_FP
+
+rf_top_FN <- rf_score_test %>%
+  filter(loan_status == "default") %>%
+  slice_min(order_by = .pred_default, n=10)
+
+rf_top_FN
+```
+
+## Tops Explaining
+
+```{r, warning=FALSE}
+rf_top10_explainer <- explain_tidymodels(
+    rf_wflow,    
+    data = train_sample,    
+    y = train_sample$loan_status,  
+    verbose = FALSE
+  )
+
+rf_explain_prediction <- function(single_record){
+rf_record_shap <- predict_parts(explainer = rf_top10_explainer, 
+                               new_observation = single_record,
+                               type="shap")
+
+rf_record_shap %>% plot() %>% print()
+
+rf_record_shap %>%
+  as_tibble() -> rf_shap_data 
+
+single_record %>% 
+ gather(key="variable_name",value="value") -> prediction_data 
+
+prediction_prob <- single_record[,".pred_default"] %>% mutate(.pred_default = round(.pred_default,3)) %>% pull() 
+
+rf_shap_data %>% 
+  inner_join(prediction_data) %>%
+  mutate(variable = paste(variable_name,value,sep = ": ")) %>% 
+  group_by(variable) %>%
+  summarize(contribution = mean(contribution)) %>%
+  mutate(contribution = round(contribution,3),
+         sign = if_else(contribution < 0, "neg","pos")) %>%
+  ggplot(aes(y=reorder(variable, contribution), x= contribution, fill=sign)) +
+  geom_col() + 
+  geom_text(aes(label=contribution))+
+  labs(
+    title = "SHAPLEY explainations",
+    subtitle = paste("predicted probablity = ",prediction_prob) ,
+                    x="contribution",
+                    y="features")
+  
+}
+```
+
+```{r}
+for (row in 1:nrow(rf_top_TP)) {
+    s_record <- rf_top_TP[row,]
+    rf_explain_prediction(s_record)
+} 
+```
+
+```{r}
+for (row in 1:nrow(rf_top_FP)) {
+    s_record <- rf_top_FP[row,]
+    rf_explain_prediction(s_record)
+} 
+```
+
+```{r}
+for (row in 1:nrow(rf_top_FN)) {
+    s_record <- rf_top_FN[row,]
+    rf_explain_prediction(s_record)
+} 
+```
+
+# Top 10 Records From RF
+## Tops Finding
+
+```{r}
+nn_score_test <- bind_cols(
+  predict(nn_wflow, test, type="prob"), 
+   predict(nn_wflow, test, type="class"),
+  test) %>% 
+  mutate(part = "test") 
+
+nn_top_TP <- nn_score_test %>%
+  filter(loan_status == "default") %>%
+  slice_max(order_by = .pred_default, n=10)
+
+nn_top_TP
+
+nn_top_FP <- nn_score_test %>%
+  filter(loan_status == "current") %>%
+  slice_max(order_by = .pred_default, n=10)
+
+nn_top_FP
+
+nn_top_FN <- nn_score_test %>%
+  filter(loan_status == "default") %>%
+  slice_min(order_by = .pred_default, n=10)
+
+nn_top_FN
+```
+
+
+## Tops Explaining
+
+```{r, warning=FALSE}
+nn_top10_explainer <- explain_tidymodels(
+    nn_wflow,    
+    data = train_sample,    
+    y = train_sample$loan_status,  
+    verbose = FALSE
+  )
+
+nn_explain_prediction <- function(single_record){
+nn_record_shap <- predict_parts(explainer = nn_top10_explainer, 
+                               new_observation = single_record,
+                               type="shap")
+
+nn_record_shap %>% plot() %>% print()
+
+nn_record_shap %>%
+  as_tibble() -> nn_shap_data 
+
+single_record %>% 
+ gather(key="variable_name",value="value") -> prediction_data 
+
+prediction_prob <- single_record[,".pred_default"] %>% mutate(.pred_default = round(.pred_default,3)) %>% pull() 
+
+nn_shap_data %>% 
+  inner_join(prediction_data) %>%
+  mutate(variable = paste(variable_name,value,sep = ": ")) %>% 
+  group_by(variable) %>%
+  summarize(contribution = mean(contribution)) %>%
+  mutate(contribution = round(contribution,3),
+         sign = if_else(contribution < 0, "neg","pos")) %>%
+  ggplot(aes(y=reorder(variable, contribution), x= contribution, fill=sign)) +
+  geom_col() + 
+  geom_text(aes(label=contribution))+
+  labs(
+    title = "SHAPLEY explainations",
+    subtitle = paste("predicted probablity = ",prediction_prob) ,
+                    x="contribution",
+                    y="features")
+  
+}
+```
+
+```{r}
+for (row in 1:nrow(nn_top_TP)) {
+    s_record <- nn_top_TP[row,]
+    nn_explain_prediction(s_record)
+} 
+```
+
+
+```{r}
+for (row in 1:nrow(nn_top_FP)) {
+    s_record <- nn_top_FP[row,]
+    nn_explain_prediction(s_record)
+} 
+```
+
+
+```{r}
+for (row in 1:nrow(nn_top_FN)) {
+    s_record <- nn_top_FN[row,]
+    nn_explain_prediction(s_record)
+} 
+```
+
+
+# Prediction
+
+```{r, warning=FALSE, message=FALSE}
+holdout <- read_csv("loan_holdout.csv") %>% 
+  clean_names()
+holdout <- holdout %>% 
+  mutate(issue_d = mdy(issue_d),
+         earliest_cr_line = year(mdy(earliest_cr_line)),
+         last_pymnt_d = mdy(last_pymnt_d),
+         last_credit_pull_d = mdy(last_credit_pull_d))
+holdout <- holdout %>% 
+  mutate(issue_w = as.numeric(difftime(Sys.time(), issue_d,  units = "weeks")),
+         earliest_cr_line_y = as.numeric(2022 - earliest_cr_line),
+         last_pymnt_w = as.numeric(difftime(Sys.time(), last_pymnt_d, units = "weeks")),
+         last_credit_pull_w = as.numeric(difftime(Sys.time(), last_credit_pull_d, units = "weeks")),
+         int_rate = as.numeric(sub("%", "", int_rate)),
+         revol_util = as.numeric(sub("%", "", revol_util)))
+
+
+holdout_score <- predict(xgb_wflow, holdout, type = "prob") %>%
+  bind_cols(predict(xgb_wflow, holdout, type = "class")) %>% 
+  bind_cols(., holdout) %>% 
+  select(id, .pred_class, .pred_default) %>% 
+  write_csv("Prediction_EmmaWang.csv")
+
+head(holdout_score)
+```
+
+
+
